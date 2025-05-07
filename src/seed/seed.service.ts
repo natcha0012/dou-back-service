@@ -36,6 +36,7 @@ export class SeedService {
     await this.updateStockPlaceOrder();
     await this.updateStockAdjustOrder();
     await this.addBranchProduct();
+    await this.setLimitProduct();
   }
 
   async updateStockPackOrder() {

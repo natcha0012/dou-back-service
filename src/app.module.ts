@@ -15,6 +15,7 @@ import { BranchProductsModule } from './branch-products/branch-products.module';
 import { BranchMasterModule } from './branch-master/branch-master.module';
 import config from './config';
 import { JwtStrategy } from './strategies/jwt.strategy';
+import { WsGateway } from './gateways/ws-gateway';
 
 @Module({
   imports: [
@@ -40,6 +41,6 @@ import { JwtStrategy } from './strategies/jwt.strategy';
     BranchMasterModule,
   ],
   controllers: [AppController],
-  providers: [AppService, StockConsumer, JwtStrategy],
+  providers: [AppService, StockConsumer, JwtStrategy, WsGateway],
 })
 export class AppModule {}

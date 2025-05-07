@@ -29,6 +29,15 @@ export class OrderController {
     return this.orderService.removeFromCart(input, user);
   }
 
+  @Get('in-cart/:id')
+  @Auth(UserRole.STAFF)
+  getOrderIncartById(
+    @Param('id') id: string,
+    @UserData() user: UserTokenPayload,
+  ) {
+    return this.orderService.getOrderIncart(user, Number(id));
+  }
+
   @Post('place-order/:id')
   @Auth(UserRole.STAFF)
   placeOrder(@Param('id') id: string, @UserData() user: UserTokenPayload) {
@@ -53,8 +62,12 @@ export class OrderController {
 
   @Post('packed/:id')
   @Auth(UserRole.ADMIN, UserRole.SUPER_ADMIN, UserRole.PACKING)
-  confirmPacked(@Param('id') id: string, @UserData() user: UserTokenPayload) {
-    return this.orderService.confirmPacked(+id, user);
+  confirmPacked(
+    @Param('id') id: string,
+    @UserData() user: UserTokenPayload,
+    @Body() input: AddToCartReq,
+  ) {
+    return this.orderService.confirmPacked(+id, input.orders, user);
   }
 
   @Post('delivering/:id')
@@ -76,13 +89,15 @@ export class OrderController {
     @Body() input: ProductProblem,
     @UserData() user: UserTokenPayload,
   ) {
-    return this.orderService.setProblem(+id, input, user);
+    // return this.orderService.setProblem(+id, input, user);
+    throw new Error('waiting for update schema');
   }
 
   @Post('approve-problems/:id')
   @Auth(UserRole.ADMIN, UserRole.SUPER_ADMIN)
   approveProblems(@Param('id') id: string, @UserData() user: UserTokenPayload) {
-    return this.orderService.approveProblem(+id, user);
+    // return this.orderService.approveProblem(+id, user);
+    throw new Error('waiting for update schema');
   }
 
   @Post('confirm-order/:id')
@@ -110,7 +125,8 @@ export class OrderController {
     @Body() input: ProductProblem,
     @UserData() user: UserTokenPayload,
   ) {
-    return this.orderService.claimProducts(+id, input, user);
+    // return this.orderService.claimProducts(+id, input, user);
+    throw new Error('waiting for update schema');
   }
 
   @Get('')

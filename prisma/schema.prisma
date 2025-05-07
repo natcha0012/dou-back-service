@@ -25,6 +25,7 @@ model User {
   Branch       Branch?       @relation(fields: [branchId], references: [id])
   D_Order      Order[]       @relation("deliver")
   P_Order      Order[]       @relation("packing")
+  Order        Order[]       @relation("user")
 
   @@index([role])
   @@map("user")
@@ -126,29 +127,48 @@ model LimitProduct {
 }
 
 model Order {
-  id              BigInt  @id @default(autoincrement())
-  branchId        Int     @map("branch_id")
-  branchName      String  @default("branch1") @map("branch_name")
-  branchMasterId  Int     @map("branch_master_id")
-  orderDetail     Json[]  @map("order_detail")
-  spoiledProducts Json[]  @map("spoiled_product")
-  status          String
-  balance         Decimal @db.Decimal(20, 2)
-  createdAt       BigInt  @default(0) @map("created_at")
-  updatedAt       BigInt  @default(0) @map("updated_at")
-  remark          String?
-  deliverId       Int?    @map("deliver_id")
-  packingId       Int?    @map("packing_id")
-  queueStatus     String? @map("queue_status") @db.VarChar(20)
+  id             BigInt  @id @default(autoincrement())
+  branchId       Int     @map("branch_id")
+  branchName     String  @default("branch1") @map("branch_name")
+  branchMasterId Int     @map("branch_master_id")
+  status         String
+  balance        Decimal @db.Decimal(20, 2)
+  createdAt      BigInt  @default(0) @map("created_at")
+  updatedAt      BigInt  @default(0) @map("updated_at")
+  deliverId      Int?    @map("deliver_id")
+  packingId      Int?    @map("packing_id")
+  createdBy      Int?    @map("created_by")
+  queueStatus    String? @map("queue_status") @db.VarChar(20)
 
-  Branch       Branch       @relation(fields: [branchId], references: [id])
-  BranchMaster BranchMaster @relation(fields: [branchMasterId], references: [id])
-  Deliver      User?        @relation(fields: [deliverId], references: [id], "deliver")
-  Packing      User?        @relation(fields: [packingId], references: [id], "packing")
+  Branch       Branch        @relation(fields: [branchId], references: [id])
+  BranchMaster BranchMaster  @relation(fields: [branchMasterId], references: [id])
+  Deliver      User?         @relation(fields: [deliverId], references: [id], "deliver")
+  Packing      User?         @relation(fields: [packingId], references: [id], "packing")
+  User         User?         @relation(fields: [createdBy], references: [id], "user")
+  OrderDetail  OrderDetail[]
 
   @@index([branchMasterId, branchId, status])
   @@index([branchId, status])
   @@map("order")
+}
+
+model OrderDetail {
+  id            BigInt  @id @default(autoincrement())
+  orderId       BigInt  @map("order_id")
+  productId     Int     @map("product_id")
+  productName   String  @map("product_name")
+  orderedAmount Decimal @map("order_amount") @db.Decimal(20, 2)
+  actualAmount  Decimal @map("actual_amount") @db.Decimal(20, 2)
+  masterRemark  String? @map("master_remark")
+  branchRemark  String? @map("branch_remark")
+  pricePerOne   Decimal @map("price_per_one") @db.Decimal(20, 2)
+  balance       Decimal @map("balance") @db.Decimal(20, 2)
+  productTypeId Int     @map("product_type_id")
+
+  Order Order @relation(fields: [orderId], references: [id])
+
+  @@unique([orderId, productId])
+  @@map("order_detail")
 }
 
 model BranchStock {

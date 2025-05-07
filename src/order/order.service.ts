@@ -1,12 +1,10 @@
 import { HttpException, HttpStatus, Injectable } from '@nestjs/common';
 import {
   AddToCartReq,
-  OrderDetail,
-  ProductProblem,
+  ProductAmount,
   RemoveFromCartReq,
-  SpoiledProductDetail,
 } from './dto/request.dto';
-import { Decimal, Prisma, PrismaService } from 'src/prisma';
+import { Decimal, Order, OrderDetail, Prisma, PrismaService } from 'src/prisma';
 import { OrderStatus } from 'src/enum/order.enum';
 import { UserTokenPayload } from 'src/types/token.type';
 import { UserRole } from 'src/enum/user.enum';
@@ -16,7 +14,12 @@ import { Queue } from 'bull';
 import { AdjustOrderJob, PlaceOrderJob } from 'src/queue/stock.consumer';
 import { QueueStatus } from 'src/enum/queue.enum';
 import { ThaiDate } from 'src/utils';
-import { ListOrderResponse, OrderResponse } from './dto/response.dto';
+import {
+  GetOrderByIDResp,
+  ListOrderResponse,
+  OrderResponse,
+  ProductDetail,
+} from './dto/response.dto';
 import { StockService } from 'src/stock/stock.service';
 
 @Injectable()
@@ -28,8 +31,8 @@ export class OrderService {
     private readonly stockService: StockService,
   ) {}
 
-  async generateOrderDetail(input: AddToCartReq) {
-    const orderDetails: OrderDetail[] = [];
+  async generateOrderDetail(input: AddToCartReq, orderId: number = 0) {
+    const orderDetails: Prisma.OrderDetailCreateManyInput[] = [];
     let totalBalance = new Decimal(0);
 
     const productIds = input.orders.map((or) => or.productId);
@@ -40,15 +43,17 @@ export class OrderService {
     for (const order of input.orders) {
       const product = products.find((p) => p.id == order.productId);
       if (!product) continue;
-      const orderDetail: OrderDetail = {
+      const orderDetail: Prisma.OrderDetailCreateManyInput = {
+        orderId,
         productId: product.id,
         productName: product.name,
-        amount: order.amount,
+        orderedAmount: new Decimal(order.amount),
+        actualAmount: new Decimal(order.amount),
         pricePerOne: product.price,
         productTypeId: product.productTypeId,
         balance: product.price.mul(order.amount),
       };
-      totalBalance = totalBalance.plus(orderDetail.balance);
+      totalBalance = totalBalance.plus(orderDetail.balance as Prisma.Decimal);
       orderDetails.push(orderDetail);
     }
 
@@ -60,20 +65,27 @@ export class OrderService {
     const orderBody: Prisma.OrderUncheckedCreateInput = {
       branchId: user.branchId,
       branchMasterId: user.branchMasterId,
-      orderDetail: orderDetails as any[],
       status: OrderStatus.IN_CART,
       balance: totalBalance,
     };
-    const order = await this.prisma.order.create({ data: orderBody });
-    delete order.queueStatus;
-    delete order.createdAt;
-    delete order.updatedAt;
-    return { ...order, id: String(order.id) };
+    const resp = await this.prisma.$transaction(async (tx) => {
+      const order = await tx.order.create({ data: orderBody });
+      orderDetails.forEach((or) => {
+        or.orderId = order.id;
+      });
+      await tx.orderDetail.createMany({ data: orderDetails });
+      delete order.queueStatus;
+      delete order.createdAt;
+      delete order.updatedAt;
+      return { ...order, id: String(order.id) };
+    });
+    return resp;
   }
 
   async removeFromCart(input: RemoveFromCartReq, user: UserTokenPayload) {
     const order = await this.prisma.order.findUnique({
       where: { id: input.orderId },
+      include: { OrderDetail: true },
     });
 
     if (
@@ -93,20 +105,26 @@ export class OrderService {
       );
     }
 
-    let orderDetails = order.orderDetail as unknown as OrderDetail[];
-    const removedProduct = orderDetails.find(
+    const removedProduct = order.OrderDetail.find(
       (or) => or.productId === input.productId,
     );
 
     const totalBalance = order.balance.minus(removedProduct.balance);
-    orderDetails = orderDetails.filter(
-      (or) => or.productId !== input.productId,
-    );
 
     if (order.status === OrderStatus.IN_CART) {
-      await this.prisma.order.update({
-        where: { id: input.orderId },
-        data: { orderDetail: orderDetails as any[], balance: totalBalance },
+      await this.prisma.$transaction(async (tx) => {
+        await tx.order.update({
+          where: { id: input.orderId },
+          data: { balance: totalBalance },
+        });
+        await tx.orderDetail.delete({
+          where: {
+            orderId_productId: {
+              orderId: input.orderId,
+              productId: input.productId,
+            },
+          },
+        });
       });
       return 'remove order success';
     }
@@ -144,8 +162,10 @@ export class OrderService {
       const adjustBody: AdjustOrderJob = {
         orderId: Number(order.id),
         reserveStock: [],
-        retrieveStock: [{ stockId, amount: removedProduct.amount }],
-        orderDetails,
+        retrieveStock: [
+          { stockId, amount: removedProduct.orderedAmount.toNumber() },
+        ],
+        orderDetails: order.OrderDetail,
         totalBalance,
       };
 
@@ -155,6 +175,31 @@ export class OrderService {
     }
   }
 
+  async getOrderIncart(user: UserTokenPayload, id?: number) {
+    let order: Order & { OrderDetail: OrderDetail[] };
+    if (id) {
+      order = await this.prisma.order.findUnique({
+        where: { id },
+        include: { OrderDetail: true },
+      });
+      if (order.createdBy !== user.id) {
+        throw new HttpException('Permission Denied', HttpStatus.UNAUTHORIZED);
+      }
+    } else {
+      order = await this.prisma.order.findFirst({
+        where: { createdBy: user.id, status: OrderStatus.IN_CART },
+        include: { OrderDetail: true },
+      });
+    }
+
+    if (!order) {
+      return { orderId: 0, detail: [] };
+    }
+
+    const orderDetail = order.OrderDetail;
+    return { orderId: String(order.id), detail: orderDetail };
+  }
+
   async adjustOrder(
     orderId: number,
     user: UserTokenPayload,
@@ -162,6 +207,7 @@ export class OrderService {
   ) {
     const order = await this.prisma.order.findUnique({
       where: { id: orderId },
+      include: { OrderDetail: true },
     });
 
     if (!order) {
@@ -181,13 +227,22 @@ export class OrderService {
         HttpStatus.BAD_REQUEST,
       );
     }
-    const { orderDetails, totalBalance } =
-      await this.generateOrderDetail(input);
+    const { orderDetails, totalBalance } = await this.generateOrderDetail(
+      input,
+      orderId,
+    );
 
     if (order.status === OrderStatus.IN_CART) {
-      await this.prisma.order.update({
-        where: { id: orderId },
-        data: { orderDetail: orderDetails as any[], balance: totalBalance },
+      await this.prisma.$transaction(async (tx) => {
+        await tx.order.update({
+          where: { id: orderId },
+          data: { balance: totalBalance },
+        });
+
+        await tx.orderDetail.updateMany({
+          where: { orderId },
+          data: orderDetails,
+        });
       });
 
       return 'adjust order success';
@@ -197,7 +252,7 @@ export class OrderService {
     if (order.status === OrderStatus.ORDER_PLACED) {
       const today = ThaiDate();
       // check order in stock
-      const oldOrderDetail = order.orderDetail as unknown as OrderDetail[];
+      const oldOrderDetail = order.OrderDetail;
       const oldProductIds = oldOrderDetail.map((or) => or.productId);
       const newProductIds = input.orders.map((or) => or.productId);
       const productIds = new Set(oldProductIds.concat(newProductIds));
@@ -235,8 +290,9 @@ export class OrderService {
         }
 
         const oldOrderAmount =
-          oldOrderDetail.find((or) => or.productId === st.productId)?.amount ??
-          0;
+          oldOrderDetail
+            .find((or) => or.productId === st.productId)
+            ?.orderedAmount.toNumber() ?? 0;
 
         if (oldOrderAmount > orderAmount) {
           adjustBody.retrieveStock.push({
@@ -259,6 +315,7 @@ export class OrderService {
   async placeOrder(orderId: number, user: UserTokenPayload) {
     const order = await this.prisma.order.findUnique({
       where: { id: orderId },
+      include: { OrderDetail: true },
     });
 
     if (!order) {
@@ -280,7 +337,7 @@ export class OrderService {
     }
 
     // check if stock have enough items
-    const orderDetail = order.orderDetail as unknown as OrderDetail[];
+    const orderDetail = order.OrderDetail;
     const productIds = orderDetail.map((or) => or.productId);
 
     const today = ThaiDate();
@@ -302,9 +359,9 @@ export class OrderService {
     };
     for (const st of stock) {
       const avaliableAmount = st.stockBalance;
-      const orderAmount = orderDetail.find(
-        (or) => or.productId === st.productId,
-      ).amount;
+      const orderAmount = orderDetail
+        .find((or) => or.productId === st.productId)
+        .orderedAmount.toNumber();
 
       if (orderAmount > avaliableAmount) {
         throw new HttpException(
@@ -349,6 +406,7 @@ export class OrderService {
   async packOrder(orderId: number, userId: number) {
     const order = await this.prisma.order.findUnique({
       where: { id: orderId },
+      include: { OrderDetail: true },
     });
 
     if (!order) {
@@ -374,7 +432,7 @@ export class OrderService {
       throw new HttpException('Order Is Not Ready Yet', HttpStatus.BAD_REQUEST);
     }
 
-    const orderDetails = order.orderDetail as unknown as OrderDetail[];
+    const orderDetails = order.OrderDetail;
 
     const today = ThaiDate();
     //Begin: for store procedure
@@ -401,17 +459,19 @@ export class OrderService {
       const ord = orderDetails.find((or) => or.productId == stock.productId);
       if (stock.date !== today) {
         createBody.push(
-          `${today}|${0}|${ord.amount}|${stock.readyToPack - ord.amount}|${
-            stock.stockBalance - ord.amount
-          }|${stock.productId}|${stock.productName}|${
-            stock.branchMasterId
-          }|${0}`,
+          `${today}|${0}|${ord.orderedAmount.toNumber()}|${
+            stock.readyToPack - ord.orderedAmount.toNumber()
+          }|${stock.stockBalance - ord.orderedAmount.toNumber()}|${
+            stock.productId
+          }|${stock.productName}|${stock.branchMasterId}|${0}`,
         );
       } else {
         updateBody.push(
-          `${String(stock.id)}|${stock.totalOut + ord.amount}|${
-            stock.readyToPack - ord.amount
-          }|${stock.stockBalance - ord.amount}`,
+          `${String(stock.id)}|${
+            stock.totalOut + ord.orderedAmount.toNumber()
+          }|${stock.readyToPack - ord.orderedAmount.toNumber()}|${
+            stock.stockBalance - ord.orderedAmount.toNumber()
+          }`,
         );
       }
     }
@@ -434,7 +494,11 @@ export class OrderService {
     return res;
   }
 
-  async confirmPacked(orderId: number, user: UserTokenPayload) {
+  async confirmPacked(
+    orderId: number,
+    actualProducts: ProductAmount[],
+    user: UserTokenPayload,
+  ) {
     const order = await this.prisma.order.findUnique({
       where: { id: orderId },
     });
@@ -447,17 +511,43 @@ export class OrderService {
       throw new HttpException('Permission Denied', HttpStatus.UNAUTHORIZED);
     }
 
-    if (order.status !== OrderStatus.PACKING) {
+    if (
+      order.status !== OrderStatus.PACKING &&
+      order.status !== OrderStatus.ORDER_PLACED
+    ) {
       throw new HttpException(
         'Order Status Must Be Packing',
         HttpStatus.BAD_REQUEST,
       );
     }
-
+    let totalBalance = new Prisma.Decimal(0);
+    // TODO do store procedure
+    // TODO in store procedure deduct order.update balace: decrement()
+    for (const product of actualProducts) {
+      const orderDatail = await this.prisma.orderDetail.findUnique({
+        where: { orderId_productId: { orderId, productId: product.productId } },
+      });
+      const balance = orderDatail.pricePerOne.mul(product.amount);
+      if (orderDatail.actualAmount.equals(product.amount)) {
+        console.log('nothing change');
+        totalBalance = totalBalance.plus(balance);
+        continue;
+      }
+      await this.prisma.orderDetail.update({
+        where: { orderId_productId: { orderId, productId: product.productId } },
+        data: {
+          actualAmount: product.amount,
+          balance,
+          masterRemark: product.masterRemark,
+        },
+      });
+      totalBalance = totalBalance.plus(balance);
+    }
     const res = await this.prisma.order.update({
       where: { id: orderId },
-      data: { status: OrderStatus.PACKED },
+      data: { status: OrderStatus.PACKED, balance: totalBalance },
     });
+
     delete res.id;
     delete res.queueStatus;
     delete res.createdAt;
@@ -495,6 +585,7 @@ export class OrderService {
   async delivered(orderId: number) {
     const order = await this.prisma.order.findUnique({
       where: { id: orderId },
+      include: { OrderDetail: true },
     });
 
     if (!order) {
@@ -507,7 +598,7 @@ export class OrderService {
         HttpStatus.BAD_REQUEST,
       );
     }
-    const orderDetails = order.orderDetail as unknown as OrderDetail[];
+    const orderDetails = order.OrderDetail;
     const today = ThaiDate();
     //Begin: for store procedure
     const productIds = orderDetails.map((or) => or.productId);
@@ -528,14 +619,14 @@ export class OrderService {
       );
       if (branchProduct.date !== today) {
         createBody.push(
-          `${today}|${ord.amount}|${ord.productId}|${ord.productName}|${
-            order.branchMasterId
-          }|${order.branchId}|${
-            branchProduct.allTimeAmount + BigInt(ord.amount)
+          `${today}|${ord.orderedAmount.toNumber()}|${ord.productId}|${
+            ord.productName
+          }|${order.branchMasterId}|${order.branchId}|${
+            branchProduct.allTimeAmount + BigInt(ord.orderedAmount.toNumber())
           }`,
         );
       } else {
-        updateBody.push(`${branchProduct.id}|${ord.amount}`);
+        updateBody.push(`${branchProduct.id}|${ord.orderedAmount.toNumber()}`);
       }
     }
     const res = await this.prisma.$transaction(async (tx) => {
@@ -558,181 +649,181 @@ export class OrderService {
   }
 
   //allow staff to update order amount in the same order id
-  async setProblem(
-    orderId: number,
-    input: ProductProblem,
-    user: UserTokenPayload,
-  ) {
-    const order = await this.prisma.order.findUnique({
-      where: { id: orderId },
-    });
+  // async setProblem(
+  //   orderId: number,
+  //   input: ProductProblem,
+  //   user: UserTokenPayload,
+  // ) {
+  //   const order = await this.prisma.order.findUnique({
+  //     where: { id: orderId },
+  //   });
 
-    if (!order) {
-      throw new HttpException('Order Not Found', HttpStatus.BAD_REQUEST);
-    }
+  //   if (!order) {
+  //     throw new HttpException('Order Not Found', HttpStatus.BAD_REQUEST);
+  //   }
 
-    if (user.role === UserRole.STAFF && order.branchId !== user.branchId) {
-      throw new HttpException('Permission Denied', HttpStatus.UNAUTHORIZED);
-    }
+  //   if (user.role === UserRole.STAFF && order.branchId !== user.branchId) {
+  //     throw new HttpException('Permission Denied', HttpStatus.UNAUTHORIZED);
+  //   }
 
-    if (
-      order.status !== OrderStatus.DELIVERED &&
-      order.status !== OrderStatus.PRODUCT_PROBLEMS
-    ) {
-      throw new HttpException(
-        'Order Status Must Be Delivered or ProductProblems',
-        HttpStatus.BAD_REQUEST,
-      );
-    }
+  //   if (
+  //     order.status !== OrderStatus.DELIVERED &&
+  //     order.status !== OrderStatus.PRODUCT_PROBLEMS
+  //   ) {
+  //     throw new HttpException(
+  //       'Order Status Must Be Delivered or ProductProblems',
+  //       HttpStatus.BAD_REQUEST,
+  //     );
+  //   }
 
-    if (input.description.slice(0, 6) === 'claim:') {
-      throw new HttpException(
-        'First Word Should Not Be Claim',
-        HttpStatus.BAD_REQUEST,
-      );
-    }
+  //   if (input.description.slice(0, 6) === 'claim:') {
+  //     throw new HttpException(
+  //       'First Word Should Not Be Claim',
+  //       HttpStatus.BAD_REQUEST,
+  //     );
+  //   }
 
-    const orderDetails = order.orderDetail as unknown as OrderDetail[];
-    let totalBalance = order.balance;
-    const spoiledProducts: SpoiledProductDetail[] = [];
-    for (const spd of input.spoiledProducts) {
-      const orderDetail = orderDetails.find(
-        (or) => or.productId === spd.productId,
-      );
-      if (!orderDetail) {
-        throw new HttpException('Invalid Product', HttpStatus.BAD_REQUEST);
-      }
-      if (orderDetail.amount < spd.amount) {
-        throw new HttpException(
-          `${orderDetail.productName} Must Less Than ${orderDetail.amount}`,
-          HttpStatus.BAD_REQUEST,
-        );
-      }
-      const pricePerOne = new Decimal(orderDetail.pricePerOne);
-      const priceLoss = pricePerOne.mul(spd.amount);
-      delete orderDetail.balance;
-      spoiledProducts.push({
-        ...orderDetail,
-        amount: spd.amount,
-        priceLoss,
-      });
-      totalBalance = totalBalance.minus(priceLoss);
-    }
+  //   const orderDetails = order.orderDetail as unknown as OrderDetail[];
+  //   let totalBalance = order.balance;
+  //   const spoiledProducts: SpoiledProductDetail[] = [];
+  //   for (const spd of input.spoiledProducts) {
+  //     const orderDetail = orderDetails.find(
+  //       (or) => or.productId === spd.productId,
+  //     );
+  //     if (!orderDetail) {
+  //       throw new HttpException('Invalid Product', HttpStatus.BAD_REQUEST);
+  //     }
+  //     if (orderDetail.amount < spd.amount) {
+  //       throw new HttpException(
+  //         `${orderDetail.productName} Must Less Than ${orderDetail.amount}`,
+  //         HttpStatus.BAD_REQUEST,
+  //       );
+  //     }
+  //     const pricePerOne = new Decimal(orderDetail.pricePerOne);
+  //     const priceLoss = pricePerOne.mul(spd.amount);
+  //     delete orderDetail.balance;
+  //     spoiledProducts.push({
+  //       ...orderDetail,
+  //       amount: spd.amount,
+  //       priceLoss,
+  //     });
+  //     totalBalance = totalBalance.minus(priceLoss);
+  //   }
 
-    if (order.status === OrderStatus.PRODUCT_PROBLEMS) {
-      const oldSpoiledProducts =
-        order.spoiledProducts as unknown as SpoiledProductDetail[];
-      for (const pd of oldSpoiledProducts) {
-        totalBalance = totalBalance.plus(pd.priceLoss);
-      }
-    }
+  //   if (order.status === OrderStatus.PRODUCT_PROBLEMS) {
+  //     const oldSpoiledProducts =
+  //       order.spoiledProducts as unknown as SpoiledProductDetail[];
+  //     for (const pd of oldSpoiledProducts) {
+  //       totalBalance = totalBalance.plus(pd.priceLoss);
+  //     }
+  //   }
 
-    const res = await this.prisma.order.update({
-      where: { id: orderId },
-      data: {
-        remark: input.description,
-        spoiledProducts: spoiledProducts as any[],
-        balance: totalBalance,
-        status: OrderStatus.PRODUCT_PROBLEMS,
-      },
-    });
-    delete res.id;
-    delete res.queueStatus;
-    delete res.createdAt;
-    delete res.updatedAt;
-    return res;
-  }
+  //   const res = await this.prisma.order.update({
+  //     where: { id: orderId },
+  //     data: {
+  //       remark: input.description,
+  //       spoiledProducts: spoiledProducts as any[],
+  //       balance: totalBalance,
+  //       status: OrderStatus.PRODUCT_PROBLEMS,
+  //     },
+  //   });
+  //   delete res.id;
+  //   delete res.queueStatus;
+  //   delete res.createdAt;
+  //   delete res.updatedAt;
+  //   return res;
+  // }
 
-  async approveProblem(orderId: number, user: UserTokenPayload) {
-    const order = await this.prisma.order.findUnique({
-      where: { id: orderId },
-    });
+  // async approveProblem(orderId: number, user: UserTokenPayload) {
+  //   const order = await this.prisma.order.findUnique({
+  //     where: { id: orderId },
+  //   });
 
-    if (!order) {
-      throw new HttpException('Order Not Found', HttpStatus.BAD_REQUEST);
-    }
+  //   if (!order) {
+  //     throw new HttpException('Order Not Found', HttpStatus.BAD_REQUEST);
+  //   }
 
-    if (
-      order.status !== OrderStatus.PRODUCT_PROBLEMS &&
-      order.status !== OrderStatus.CLAIM
-    ) {
-      throw new HttpException(
-        'Order Status Must Be Product Problems',
-        HttpStatus.BAD_REQUEST,
-      );
-    }
+  //   if (
+  //     order.status !== OrderStatus.PRODUCT_PROBLEMS &&
+  //     order.status !== OrderStatus.CLAIM
+  //   ) {
+  //     throw new HttpException(
+  //       'Order Status Must Be Product Problems',
+  //       HttpStatus.BAD_REQUEST,
+  //     );
+  //   }
 
-    if (
-      user.role === UserRole.ADMIN &&
-      order.branchMasterId !== user.branchMasterId
-    ) {
-      throw new HttpException(
-        `Permission Denied: user should be in branch master id ${order.branchMasterId}`,
-        HttpStatus.BAD_REQUEST,
-      );
-    }
-    const today = ThaiDate();
+  //   if (
+  //     user.role === UserRole.ADMIN &&
+  //     order.branchMasterId !== user.branchMasterId
+  //   ) {
+  //     throw new HttpException(
+  //       `Permission Denied: user should be in branch master id ${order.branchMasterId}`,
+  //       HttpStatus.BAD_REQUEST,
+  //     );
+  //   }
+  //   const today = ThaiDate();
 
-    const checkStock = await this.prisma.stock.findFirst({
-      where: {
-        branchMasterId: order.branchMasterId,
-        date: today,
-      },
-    });
+  //   const checkStock = await this.prisma.stock.findFirst({
+  //     where: {
+  //       branchMasterId: order.branchMasterId,
+  //       date: today,
+  //     },
+  //   });
 
-    if (!checkStock) {
-      await this.stockService.createNewDayStock(order.branchMasterId);
-    }
+  //   if (!checkStock) {
+  //     await this.stockService.createNewDayStock(order.branchMasterId);
+  //   }
 
-    const spoiledProducts =
-      order.spoiledProducts as unknown as SpoiledProductDetail[];
-    const res = await this.prisma.$transaction(async (tx) => {
-      for (const sp of spoiledProducts) {
-        const stock = await tx.stock.findFirst({
-          where: {
-            branchMasterId: order.branchMasterId,
-            date: today,
-            productId: sp.productId,
-          },
-        });
+  //   const spoiledProducts =
+  //     order.spoiledProducts as unknown as SpoiledProductDetail[];
+  //   const res = await this.prisma.$transaction(async (tx) => {
+  //     for (const sp of spoiledProducts) {
+  //       const stock = await tx.stock.findFirst({
+  //         where: {
+  //           branchMasterId: order.branchMasterId,
+  //           date: today,
+  //           productId: sp.productId,
+  //         },
+  //       });
 
-        if (!stock) {
-          throw new HttpException(
-            'Internal Server Error: Stock Not Found',
-            HttpStatus.INTERNAL_SERVER_ERROR,
-          );
-        }
+  //       if (!stock) {
+  //         throw new HttpException(
+  //           'Internal Server Error: Stock Not Found',
+  //           HttpStatus.INTERNAL_SERVER_ERROR,
+  //         );
+  //       }
 
-        const totalOut =
-          order.status === OrderStatus.PRODUCT_PROBLEMS ? 0 : sp.amount;
+  //       const totalOut =
+  //         order.status === OrderStatus.PRODUCT_PROBLEMS ? 0 : sp.amount;
 
-        await tx.stock.update({
-          where: { id: stock.id },
-          data: {
-            totalOut: { increment: totalOut },
-            stockBalance: { decrement: totalOut },
-            spoiledAmount: stock.spoiledAmount + sp.amount,
-          },
-        });
-      }
+  //       await tx.stock.update({
+  //         where: { id: stock.id },
+  //         data: {
+  //           totalOut: { increment: totalOut },
+  //           stockBalance: { decrement: totalOut },
+  //           spoiledAmount: stock.spoiledAmount + sp.amount,
+  //         },
+  //       });
+  //     }
 
-      const updatedOrder = await tx.order.update({
-        where: { id: orderId },
-        data: {
-          status:
-            order.status === OrderStatus.PRODUCT_PROBLEMS
-              ? OrderStatus.WAITING_FOR_PAYMENT
-              : OrderStatus.SUCCESS,
-        },
-      });
-      delete updatedOrder.id;
-      delete updatedOrder.queueStatus;
-      delete updatedOrder.createdAt;
-      delete updatedOrder.updatedAt;
-      return updatedOrder;
-    });
-    return res;
-  }
+  //     const updatedOrder = await tx.order.update({
+  //       where: { id: orderId },
+  //       data: {
+  //         status:
+  //           order.status === OrderStatus.PRODUCT_PROBLEMS
+  //             ? OrderStatus.WAITING_FOR_PAYMENT
+  //             : OrderStatus.SUCCESS,
+  //       },
+  //     });
+  //     delete updatedOrder.id;
+  //     delete updatedOrder.queueStatus;
+  //     delete updatedOrder.createdAt;
+  //     delete updatedOrder.updatedAt;
+  //     return updatedOrder;
+  //   });
+  //   return res;
+  // }
 
   async confirmOrder(orderId: number, user: UserTokenPayload) {
     const order = await this.prisma.order.findUnique({
@@ -842,83 +933,83 @@ export class OrderService {
     return res;
   }
 
-  async claimProducts(
-    orderId: number,
-    input: ProductProblem,
-    user: UserTokenPayload,
-  ) {
-    //Validation
-    const order = await this.prisma.order.findUnique({
-      where: { id: orderId },
-    });
+  // async claimProducts(
+  //   orderId: number,
+  //   input: ProductProblem,
+  //   user: UserTokenPayload,
+  // ) {
+  //   //Validation
+  //   const order = await this.prisma.order.findUnique({
+  //     where: { id: orderId },
+  //   });
 
-    if (!order) {
-      throw new HttpException('Order Not Found', HttpStatus.BAD_REQUEST);
-    }
+  //   if (!order) {
+  //     throw new HttpException('Order Not Found', HttpStatus.BAD_REQUEST);
+  //   }
 
-    if (user.role === UserRole.STAFF && order.branchId !== user.branchId) {
-      throw new HttpException('Permission Denied', HttpStatus.UNAUTHORIZED);
-    }
+  //   if (user.role === UserRole.STAFF && order.branchId !== user.branchId) {
+  //     throw new HttpException('Permission Denied', HttpStatus.UNAUTHORIZED);
+  //   }
 
-    if (
-      order.status !== OrderStatus.SUCCESS &&
-      order.status !== OrderStatus.CLAIM
-    ) {
-      throw new HttpException(
-        'Order Status Must Be Success or Claim',
-        HttpStatus.BAD_REQUEST,
-      );
-    }
+  //   if (
+  //     order.status !== OrderStatus.SUCCESS &&
+  //     order.status !== OrderStatus.CLAIM
+  //   ) {
+  //     throw new HttpException(
+  //       'Order Status Must Be Success or Claim',
+  //       HttpStatus.BAD_REQUEST,
+  //     );
+  //   }
 
-    if (order.status === OrderStatus.SUCCESS && order.remark) {
-      throw new HttpException(
-        'This Order Is Already Claim',
-        HttpStatus.BAD_REQUEST,
-      );
-    }
+  //   if (order.status === OrderStatus.SUCCESS && order.remark) {
+  //     throw new HttpException(
+  //       'This Order Is Already Claim',
+  //       HttpStatus.BAD_REQUEST,
+  //     );
+  //   }
 
-    const orderDetails = order.orderDetail as unknown as OrderDetail[];
-    const spoiledProducts: SpoiledProductDetail[] = [];
+  //   const orderDetails = order.orderDetail as unknown as OrderDetail[];
+  //   const spoiledProducts: SpoiledProductDetail[] = [];
 
-    // Begin Claim
-    for (const spd of input.spoiledProducts) {
-      const orderDetail = orderDetails.find(
-        (or) => or.productId === spd.productId,
-      );
-      if (!orderDetail) {
-        throw new HttpException('Invalid Product', HttpStatus.BAD_REQUEST);
-      }
-      if (orderDetail.amount < spd.amount) {
-        throw new HttpException(
-          `${orderDetail.productName} Must Less Than ${orderDetail.amount}`,
-          HttpStatus.BAD_REQUEST,
-        );
-      }
-      delete orderDetail.balance;
-      spoiledProducts.push({
-        ...orderDetail,
-        amount: spd.amount,
-        priceLoss: new Decimal(0),
-      });
-    }
-    if (input.description.slice(0, 6) !== 'claim:') {
-      input.description = `claim: ${input.description}`;
-    }
+  //   // Begin Claim
+  //   for (const spd of input.spoiledProducts) {
+  //     const orderDetail = orderDetails.find(
+  //       (or) => or.productId === spd.productId,
+  //     );
+  //     if (!orderDetail) {
+  //       throw new HttpException('Invalid Product', HttpStatus.BAD_REQUEST);
+  //     }
+  //     if (orderDetail.amount < spd.amount) {
+  //       throw new HttpException(
+  //         `${orderDetail.productName} Must Less Than ${orderDetail.amount}`,
+  //         HttpStatus.BAD_REQUEST,
+  //       );
+  //     }
+  //     delete orderDetail.balance;
+  //     spoiledProducts.push({
+  //       ...orderDetail,
+  //       amount: spd.amount,
+  //       priceLoss: new Decimal(0),
+  //     });
+  //   }
+  //   if (input.description.slice(0, 6) !== 'claim:') {
+  //     input.description = `claim: ${input.description}`;
+  //   }
 
-    const res = await this.prisma.order.update({
-      where: { id: orderId },
-      data: {
-        remark: input.description,
-        spoiledProducts: spoiledProducts as any[],
-        status: OrderStatus.CLAIM,
-      },
-    });
-    delete res.id;
-    delete res.queueStatus;
-    delete res.createdAt;
-    delete res.updatedAt;
-    return res;
-  }
+  //   const res = await this.prisma.order.update({
+  //     where: { id: orderId },
+  //     data: {
+  //       remark: input.description,
+  //       spoiledProducts: spoiledProducts as any[],
+  //       status: OrderStatus.CLAIM,
+  //     },
+  //   });
+  //   delete res.id;
+  //   delete res.queueStatus;
+  //   delete res.createdAt;
+  //   delete res.updatedAt;
+  //   return res;
+  // }
 
   getNeedToActionStatus(role: UserRole) {
     switch (role) {
@@ -1108,24 +1199,34 @@ export class OrderService {
     };
   }
 
-  async getOrder(orderId: string) {
+  async getOrder(orderId: string): Promise<GetOrderByIDResp> {
     const order = await this.prisma.order.findUnique({
       where: { id: BigInt(orderId) },
+      include: { OrderDetail: true },
     });
 
     delete order.queueStatus;
-    const orderDetail = order.orderDetail as unknown as OrderDetail[];
-    const orderDetailByProductTypeId: Record<
-      number,
-      Omit<OrderDetail, 'productTypeId'>[]
-    > = {};
+    const orderDetail = order.OrderDetail;
+    const orderDetailByProductTypeId: Record<number, ProductDetail[]> = {};
 
     const orderDetailByProductType: {
       productType: string;
-      products: Omit<OrderDetail, 'productTypeId'>[];
+      products: ProductDetail[];
     }[] = [];
     orderDetail.map((or) => {
-      const { productTypeId, ...product } = or;
+      const { productTypeId } = or;
+      const product: ProductDetail = {
+        productId: or.productId,
+        productName: or.productName,
+        orderedAmount: or.orderedAmount.toNumber(),
+        actualAmount: or.actualAmount.toNumber(),
+        pricePerOne: or.pricePerOne.toNumber(),
+        balance: or.balance.toNumber(),
+        remark: {
+          masterRemark: or.masterRemark,
+          branchRemark: or.branchRemark,
+        },
+      };
       if (!orderDetailByProductTypeId[productTypeId]) {
         orderDetailByProductTypeId[productTypeId] = [product];
       } else {
@@ -1147,13 +1248,18 @@ export class OrderService {
       });
     });
 
-    return {
+    delete order.OrderDetail;
+
+    const resp = {
       ...order,
       balance: order.balance.toFixed(2),
       id: orderId,
+      totalItems: orderDetail.length ?? 0,
       orderDetail: orderDetailByProductType,
       createdAt: ThaiDate(Number(order.createdAt)),
       updatedAt: ThaiDate(Number(order.updatedAt)),
     };
+
+    return resp;
   }
 }

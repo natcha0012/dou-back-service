@@ -1,6 +1,12 @@
 import { Prisma } from '@prisma/client';
 import { Type } from 'class-transformer';
-import { IsArray, IsNumber, IsString, ValidateNested } from 'class-validator';
+import {
+  IsArray,
+  IsNumber,
+  IsOptional,
+  IsString,
+  ValidateNested,
+} from 'class-validator';
 
 export class AddToCartReq {
   @IsArray()
@@ -15,6 +21,14 @@ export class ProductAmount {
 
   @IsNumber()
   amount: number;
+
+  @IsOptional()
+  @IsString()
+  masterRemark?: string;
+
+  @IsOptional()
+  @IsString()
+  branchRemark?: string;
 }
 
 export class RemoveFromCartReq {
@@ -23,15 +37,6 @@ export class RemoveFromCartReq {
 
   @IsNumber()
   productId: number;
-}
-
-export class OrderDetail {
-  productId: number;
-  productName: string;
-  amount: number;
-  pricePerOne: Prisma.Decimal;
-  balance: Prisma.Decimal;
-  productTypeId: number;
 }
 
 export class SpoiledProductDetail {

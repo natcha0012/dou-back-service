@@ -7,8 +7,9 @@ import {
 import { Logger } from '@nestjs/common';
 import { Job } from 'bull';
 import { STOCK_QUEUE } from 'src/constants/queue';
+import { wsEvent } from 'src/enum/event.enum';
 import { QueueStatus } from 'src/enum/queue.enum';
-import { OrderDetail } from 'src/order/dto/request.dto';
+import { WsGateway } from 'src/gateways/ws-gateway';
 import { Prisma, PrismaService } from 'src/prisma';
 import { ThaiDate } from 'src/utils';
 
@@ -35,13 +36,16 @@ export type AdjustOrderJob = {
   reserveStock: StockAmount[];
   retrieveStock: StockAmount[];
 
-  orderDetails: OrderDetail[];
+  orderDetails: Prisma.OrderDetailCreateManyInput[];
   totalBalance: Prisma.Decimal;
 };
 
 @Processor(STOCK_QUEUE)
 export class StockConsumer {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly wsGateway: WsGateway,
+  ) {}
 
   @Process('add_stock')
   async addStock(job: Job<AddStockJob>) {
@@ -87,6 +91,11 @@ export class StockConsumer {
         .$executeRaw`CALL update_stock_place_order(${sqlReadyTopacks.join(
         '##',
       )}, ${data.orderId})`;
+      this.wsGateway.emitMessage({
+        room: 'parent',
+        eventName: wsEvent.TRICKER_ORDER,
+        message: 'success',
+      });
       return { orderId: String(data.orderId), jobName: 'place_order' };
     } catch (err) {
       Logger.error(err, 'PLACE_ORDER');
@@ -118,10 +127,14 @@ export class StockConsumer {
         await tx.order.update({
           where: { id: data.orderId },
           data: {
-            orderDetail: data.orderDetails as any[],
+            // orderDetail: data.orderDetails as any[],
             balance: data.totalBalance,
             queueStatus: QueueStatus.IN_PROGRESS,
           },
+        });
+        await tx.orderDetail.updateMany({
+          where: { orderId: data.orderId },
+          data: data.orderDetails,
         });
       });
       return { orderId: String(data.orderId), jobName: 'adjust_order' };
